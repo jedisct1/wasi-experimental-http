@@ -14,20 +14,52 @@ export function request(req: Request): Response {
 export class Response {
     /** The HTTP response status code. */
     public status: StatusCode;
-    /** The HTTP response headers. */
-    public headers: Map<string, string>;
-    /** The response body as a byte array.
-     *
-     * It should be decoded by the consumer accordingly.
-     * If expecting a UTF string, use the built-in functions
-     * to decode.
-     */
-    public body: ArrayBuffer;
 
-    constructor(status: u16, headers: Map<string, string>, body: ArrayBuffer) {
+    /** The response handle */
+    public handle: u32;
+
+    constructor(status: u16, handle: u32) {
         this.status = status;
-        this.headers = headers;
-        this.body = body;
+        this.handle = handle;
+    }
+
+    public bodyRead(buffer: ArrayBuffer): usize {
+        let buf_read_ptr = memory.data(8);
+        if (body_read(this.handle, changetype<usize>(buffer), buffer.byteLength, buf_read_ptr) != 0) {
+            return 0;
+        }
+        return load<isize>(buf_read_ptr);
+    }
+
+    public bodyReadAll(): Uint8Array {
+        let chunk = new Uint8Array(4096);
+        let buf = new Array<u8>();
+        while (true) {
+            let count = this.bodyRead(chunk.buffer);
+            if (count <= 0) {
+                return changetype<Uint8Array>(buf);
+            }
+            for (let i: u32 = 0; i < (count as u32); i++) {
+                buf.push(chunk[i]);
+            }
+        }
+    }
+
+    public headerGet(name: string): string {
+        let name_buf = String.UTF8.encode(name);
+        let name_ptr = changetype<usize>(name_buf);
+        let name_len = name_buf.byteLength;
+
+        let value_buf = new Uint8Array(4096);
+        let value_buf_ptr = changetype<usize>(value_buf.buffer);
+        let value_buf_len = value_buf.byteLength;
+        let value_len_ptr = memory.data(8);
+
+        if (header_get(this.handle, name_ptr, name_len, value_buf_ptr, value_buf_len, value_len_ptr) != 0) {
+            return "";
+        }
+        let value = value_buf.subarray(0, load<u32>(value_len_ptr));
+        return String.UTF8.decode(value.buffer);
     }
 }
 
@@ -69,7 +101,7 @@ export class Request {
         .send();
     Console.log(res.status.toString())
     Console.log(res.headers);
-    let result = String.UTF8.decode(res.body);
+    let result = String.UTF8.decode(res.bodyReadAll().buffer);
     Console.log(result);
  * ```
 */
@@ -119,13 +151,38 @@ export class RequestBuilder {
     res_handle_ptr: usize,
 ): u32;
 
+// @ts-ignore: decorator
+@external("wasi_experimental_http", "close")
+@unsafe declare function close(
+    handle: usize
+): u32;
+
+// @ts-ignore: decorator
+@external("wasi_experimental_http", "header_get")
+@unsafe declare function header_get(
+    handle: usize,
+    name_ptr: usize,
+    name_len: usize,
+    value_ptr: usize,
+    value_len: usize,
+    value_written_ptr: usize,
+): u32;
+
+// @ts-ignore: decorator
+@external("wasi_experimental_http", "body_read")
+@unsafe declare function body_read(
+    handle: usize,
+    buf_ptr: usize,
+    buf_len: usize,
+    but_read_ptr: usize
+): u32;
+
 function raw_request(
     url: string,
     method: string,
     headers: string,
     body: ArrayBuffer
 ): Response {
-
     let url_buf = String.UTF8.encode(url);
     let url_ptr = changetype<usize>(url_buf);
     let url_len = url_buf.byteLength;
@@ -134,37 +191,27 @@ function raw_request(
     let method_ptr = changetype<usize>(method_buf);
     let method_len = method_buf.byteLength;
 
-    let headers_buf = String.UTF8.encode(headers);
-    let headers_ptr = changetype<usize>(headers_buf);
-    let headers_len = headers_buf.byteLength;
+    let req_headers_buf = String.UTF8.encode(headers);
+    let req_headers_ptr = changetype<usize>(req_headers_buf);
+    let req_headers_len = req_headers_buf.byteLength;
 
     let req_body_ptr = changetype<usize>(body);
     let req_body_len = body.byteLength;
 
-    let body_res_ptr = memory.data(8);
-    let body_written_ptr = memory.data(8);
-    let headers_res_ptr = memory.data(8);
-    let headers_written_ptr = memory.data(8);
     let status_code_ptr = memory.data(8);
-    let err_ptr = memory.data(8);
-    let err_written_ptr = memory.data(8);
+    let res_handle_ptr = memory.data(8);
 
     let err = req(
         url_ptr,
         url_len,
         method_ptr,
         method_len,
+        req_headers_ptr,
+        req_headers_len,
         req_body_ptr,
         req_body_len,
-        headers_ptr,
-        headers_len,
-        body_res_ptr,
-        body_written_ptr,
-        headers_res_ptr,
-        headers_written_ptr,
         status_code_ptr,
-        err_ptr,
-        err_written_ptr
+        res_handle_ptr,
     );
 
     if (err != 0) {
@@ -177,16 +224,15 @@ function raw_request(
             abort();
         }
 
-        // An error code was written. Read it, then abort.
-        let err_len = load<usize>(err_written_ptr) as u32;
-        let err_buf = new ArrayBuffer(err_len);
-        memory.copy(changetype<usize>(err_buf), err_ptr, err_len);
-        Console.log("Runtime error: " + String.UTF8.decode(err_buf));
+        // An error code was written. Read it, then abort.       
+        Console.log("Runtime error: " + err.toString());
         abort();
     }
 
     let status = load<usize>(status_code_ptr) as u16;
+    let handle = load<usize>(res_handle_ptr) as u32;
 
+    /*
     let body_size = load<usize>(body_written_ptr) as u32;
     let body_res = new ArrayBuffer(body_size);
     memory.copy(changetype<usize>(body_res), load<usize>(body_res_ptr), body_size);
@@ -195,8 +241,9 @@ function raw_request(
     let headers_res_buf = new ArrayBuffer(headers_length);
     memory.copy(changetype<usize>(headers_res_buf), load<usize>(headers_res_ptr), headers_length);
     let headers_res = String.UTF8.decode(headers_res_buf);
+    */
 
-    return new Response(status, stringToHeaderMap(headers_res), body_res);
+    return new Response(status, handle);
 }
 
 /** Transform the header map into a string. */
@@ -207,19 +254,6 @@ function headersToString(headers: Map<string, string>): string {
     for (let index = 0, len = keys.length; index < len; ++index) {
         res += keys[index] + ":" + values[index] + '\n';
     }
-    return res;
-}
-
-/** Transform the string representation of the headers into a map. */
-function stringToHeaderMap(headersStr: string): Map<string, string> {
-    let res = new Map<string, string>();
-    let parts = headersStr.split("\n");
-    // the result of the split contains an empty part as well
-    for (let index = 0, len = parts.length - 1; index < len; index++) {
-        let p = parts[index].split(":");
-        res.set(p[0], p[1]);
-    }
-
     return res;
 }
 

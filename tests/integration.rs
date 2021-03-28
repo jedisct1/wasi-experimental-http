@@ -66,7 +66,9 @@ mod tests {
     /// Execute the module's `_start` function.
     fn run_tests(instance: &Instance, test_funcs: &[&str]) -> Result<(), Error> {
         for func_name in test_funcs.iter() {
-            let func = instance.get_func(func_name).expect("cannot find function");
+            let func = instance
+                .get_func(func_name)
+                .expect(&format!("cannot find function {}", func_name));
             func.call(&[])?;
         }
 

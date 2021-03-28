@@ -12,7 +12,7 @@ export function post(): void {
     .body(body)
     .send();
 
-  check(res, 200, 7);
+  check(res, 200, "Content-Type");
 }
 
 export function get(): void {
@@ -20,8 +20,9 @@ export function get(): void {
     .method(Method.GET)
     .send();
 
-  check(res, 200, 6);
-  if (String.UTF8.decode(res.body) != '"OK"') {
+  check(res, 200, "Content-Type");
+  let body = res.bodyReadAll();
+  if (String.UTF8.decode(body.buffer) != '"OK"') {
     abort();
   }
 }
@@ -29,26 +30,20 @@ export function get(): void {
 function check(
   res: Response,
   expectedStatus: u32,
-  expectedHeadersLen: u32
+  expectedHeader: string
 ): void {
   if (res.status != expectedStatus) {
     Console.write(
       "expected status " +
-        expectedStatus.toString() +
-        " got " +
-        res.status.toString()
+      expectedStatus.toString() +
+      " got " +
+      res.status.toString()
     );
     abort();
   }
 
-  let len = (res.headers.keys() as Array<string>).length;
-  if (len != expectedHeadersLen) {
-    Console.write(
-      "expected " +
-        expectedHeadersLen.toString() +
-        " headers, got " +
-        len.toString()
-    );
+  let headerValue = res.headerGet(expectedHeader);
+  if (!headerValue) {
     abort();
   }
 }
