@@ -11,7 +11,6 @@ use tokio::runtime::Handle;
 use url::Url;
 use wasmtime::*;
 
-const ALLOC_FN: &str = "alloc";
 const MEMORY: &str = "memory";
 
 pub type WasiHandle = u32;
@@ -29,7 +28,207 @@ struct Response {
 #[derive(Default)]
 pub struct State {
     responses: HashMap<WasiHandle, Response>,
-    current_response_id: WasiHandle,
+    current_handle: WasiHandle,
+}
+
+#[derive(Debug, thiserror::Error)]
+enum HttpError {
+    #[error("Invalid handle: [{0}]")]
+    InvalidHandle(WasiHandle),
+    #[error("Memory not found")]
+    MemoryNotFound,
+    #[error("Memory access error")]
+    MemoryAccessError(#[from] wasmtime::MemoryAccessError),
+    #[error("Buffer too small")]
+    BufferTooSmall,
+    #[error("Header not found")]
+    HeaderNotFound,
+    #[error("UTF-8 error")]
+    UTF8Error(#[from] std::str::Utf8Error),
+    #[error("Destination not allowed")]
+    DestinationNotAllowed(String),
+    #[error("Invalid method")]
+    InvalidMethod,
+    #[error("Invalid encoding")]
+    InvalidEncoding,
+    #[error("Invalid URL")]
+    InvalidUrl,
+    #[error("HTTP error")]
+    RequestError(#[from] reqwest::Error),
+    #[error("Runtime error")]
+    RuntimeError,
+    #[error("Too many sessions")]
+    TooManySessions,
+}
+
+impl From<HttpError> for u32 {
+    fn from(e: HttpError) -> u32 {
+        match e {
+            HttpError::InvalidHandle(_) => 1,
+            HttpError::MemoryNotFound => 2,
+            HttpError::MemoryAccessError(_) => 3,
+            HttpError::BufferTooSmall => 4,
+            HttpError::HeaderNotFound => 5,
+            HttpError::UTF8Error(_) => 6,
+            HttpError::DestinationNotAllowed(_) => 7,
+            HttpError::InvalidMethod => 8,
+            HttpError::InvalidEncoding => 9,
+            HttpError::InvalidUrl => 10,
+            HttpError::RequestError(_) => 11,
+            HttpError::RuntimeError => 12,
+            HttpError::TooManySessions => 13,
+        }
+    }
+}
+
+fn memory_get(caller: Caller<'_>) -> Result<Memory, HttpError> {
+    if let Some(Extern::Memory(mem)) = caller.get_export(MEMORY) {
+        Ok(mem)
+    } else {
+        Err(HttpError::MemoryNotFound)
+    }
+}
+
+fn slice_from_memory(memory: &Memory, offset: u32, len: u32) -> Result<&[u8], HttpError> {
+    let required_memory_size = offset.checked_add(len).ok_or(HttpError::BufferTooSmall)? as usize;
+    if required_memory_size > memory.data_size() {
+        return Err(HttpError::BufferTooSmall);
+    }
+    let slice =
+        &unsafe { memory.data_unchecked() }[offset as usize..offset as usize + len as usize];
+    Ok(slice)
+}
+
+fn string_from_memory(memory: &Memory, offset: u32, len: u32) -> Result<&str, HttpError> {
+    let slice = slice_from_memory(memory, offset, len)?;
+    Ok(std::str::from_utf8(slice)?)
+}
+
+struct HostCalls;
+
+impl HostCalls {
+    fn close(
+        st: Rc<RefCell<State>>,
+        _caller: Caller<'_>,
+        handle: WasiHandle,
+    ) -> Result<(), HttpError> {
+        st.borrow_mut().responses.remove(&handle);
+        Ok(())
+    }
+
+    fn body_read(
+        st: Rc<RefCell<State>>,
+        caller: Caller<'_>,
+        handle: WasiHandle,
+        buf_ptr: u32,
+        buf_len: u32,
+        buf_written_ptr: u32,
+    ) -> Result<(), HttpError> {
+        let mut st = st.borrow_mut();
+        let mut body = &mut st
+            .responses
+            .get_mut(&handle)
+            .ok_or(HttpError::InvalidHandle(handle))?
+            .body;
+        let memory = memory_get(caller)?;
+        let available = std::cmp::min(buf_len as _, body.bytes.len() - body.pos);
+        memory.write(buf_ptr as _, &body.bytes[body.pos..body.pos + available])?;
+        body.pos += available;
+        memory.write(buf_written_ptr as _, &(available as u32).to_le_bytes())?;
+        Ok(())
+    }
+
+    fn header_get(
+        st: Rc<RefCell<State>>,
+        caller: Caller<'_>,
+        handle: WasiHandle,
+        key_ptr: u32,
+        key_len: u32,
+        value_ptr: u32,
+        value_len: u32,
+        value_written_ptr: u32,
+    ) -> Result<(), HttpError> {
+        let st = st.borrow();
+        let headers = &st
+            .responses
+            .get(&handle)
+            .ok_or(HttpError::InvalidHandle(handle))?
+            .headers;
+        let memory = memory_get(caller)?;
+        let key = string_from_memory(&memory, key_ptr, key_len)?;
+        let value = headers.get(key).ok_or(HttpError::HeaderNotFound)?;
+        if value.len() > value_len as _ {
+            return Err(HttpError::BufferTooSmall);
+        }
+        memory.write(value_ptr as _, value.as_bytes())?;
+        memory.write(value_written_ptr as _, &(value.len() as u32).to_le_bytes())?;
+        Ok(())
+    }
+
+    fn req(
+        st: Rc<RefCell<State>>,
+        allowed_hosts: Option<&[String]>,
+        caller: Caller<'_>,
+        url_ptr: u32,
+        url_len: u32,
+        method_ptr: u32,
+        method_len: u32,
+        req_headers_ptr: u32,
+        req_headers_len: u32,
+        req_body_ptr: u32,
+        req_body_len: u32,
+        status_code_ptr: u32,
+        res_handle_ptr: u32,
+    ) -> Result<(), HttpError> {
+        let span = tracing::trace_span!("req");
+        let _enter = span.enter();
+        let memory = memory_get(caller)?;
+        let url = string_from_memory(&memory, url_ptr, url_len)?;
+        let method = Method::from_str(string_from_memory(&memory, method_ptr, method_len)?)
+            .map_err(|_| HttpError::InvalidMethod)?;
+        let req_body = slice_from_memory(&memory, req_body_ptr, req_body_len)?;
+        let headers = wasi_experimental_http::string_to_header_map(string_from_memory(
+            &memory,
+            req_headers_ptr,
+            req_headers_len,
+        )?)
+        .map_err(|_| HttpError::InvalidEncoding)?;
+
+        if !is_allowed(url, allowed_hosts)? {
+            return Err(HttpError::DestinationNotAllowed(url.to_string()));
+        }
+
+        let (status, resp_headers, resp_body) = request(url, headers, method, req_body)?;
+        tracing::debug!(
+            status,
+            ?resp_headers,
+            body_len = resp_body.as_ref().len(),
+            "got HTTP response, writing back to memory"
+        );
+
+        memory.write(status_code_ptr as _, &status.to_le_bytes())?;
+
+        let response = Response {
+            headers: resp_headers,
+            body: Body {
+                bytes: resp_body.to_vec(),
+                pos: 0,
+            },
+        };
+        let mut st = st.borrow_mut();
+        let initial_handle = st.current_handle;
+        while st.responses.get(&st.current_handle).is_some() {
+            st.current_handle += 1;
+            if st.current_handle == initial_handle {
+                return Err(HttpError::TooManySessions);
+            }
+        }
+        let handle = st.current_handle;
+        st.responses.insert(handle, response);
+        memory.write(res_handle_ptr as _, &handle.to_le_bytes())?;
+
+        Ok(())
+    }
 }
 
 pub fn link_http(
@@ -41,9 +240,11 @@ pub fn link_http(
     linker.func(
         "wasi_experimental_http",
         "close",
-        move |_caller: Caller<'_>, handle: WasiHandle| -> u32 {
-            st.borrow_mut().responses.remove(&handle);
-            0
+        move |caller: Caller<'_>, handle: WasiHandle| -> u32 {
+            match HostCalls::close(st.clone(), caller, handle) {
+                Ok(()) => 0,
+                Err(e) => e.into(),
+            }
         },
     )?;
 
@@ -57,30 +258,17 @@ pub fn link_http(
               buf_len: u32,
               buf_written_ptr: u32|
               -> u32 {
-            let mut st = st.borrow_mut();
-            let body = match st.responses.get_mut(&handle) {
-                None => return 1,
-                Some(response) => &mut response.body,
-            };
-            let memory = match caller.get_export(MEMORY) {
-                Some(Extern::Memory(mem)) => mem,
-                _ => return 5,
-            };
-            let available = std::cmp::min(buf_len as _, body.bytes.len() - body.pos);
-            if memory
-                .write(buf_ptr as _, &body.bytes[body.pos..body.pos + available])
-                .is_err()
-            {
-                return 6;
-            };
-            body.pos += available;
-            if memory
-                .write(buf_written_ptr as _, &(available as u32).to_le_bytes())
-                .is_err()
-            {
-                return 6;
+            match HostCalls::body_read(
+                st.clone(),
+                caller,
+                handle,
+                buf_ptr,
+                buf_len,
+                buf_written_ptr,
+            ) {
+                Ok(()) => 0,
+                Err(e) => e.into(),
             }
-            0
         },
     )?;
 
@@ -96,40 +284,23 @@ pub fn link_http(
               value_len: u32,
               value_written_ptr: u32|
               -> u32 {
-            let st = st.borrow();
-            let headers = match st.responses.get(&handle) {
-                None => return 1,
-                Some(response) => &response.headers,
-            };
-            let memory = match caller.get_export(MEMORY) {
-                Some(Extern::Memory(mem)) => mem,
-                _ => return 5,
-            };
-
-            let required_size = key_ptr.checked_add(key_len).unwrap() as _;
-            if memory.data_size() < required_size {
-                return 6;
+            match HostCalls::header_get(
+                st.clone(),
+                caller,
+                handle,
+                key_ptr,
+                key_len,
+                value_ptr,
+                value_len,
+                value_written_ptr,
+            ) {
+                Ok(()) => 0,
+                Err(e) => e.into(),
             }
-            let key = &unsafe { memory.data_unchecked() }
-                [key_ptr as usize..key_ptr as usize + key_len as usize];
-            let key = std::str::from_utf8(key).unwrap();
-            let value = match headers.get(key) {
-                None => return 7,
-                Some(value) => value,
-            };
-            if value.len() > value_len as _ {
-                return 9;
-            }
-            if memory.write(value_ptr as _, value.as_bytes()).is_err() {
-                return 8;
-            }
-            memory
-                .write(value_written_ptr as _, &(value.len() as u32).to_le_bytes())
-                .unwrap();
-            0
         },
     )?;
 
+    let st = state.clone();
     linker.func(
         "wasi_experimental_http",
         "req",
@@ -138,152 +309,30 @@ pub fn link_http(
               url_len: u32,
               method_ptr: u32,
               method_len: u32,
-              req_body: u32,
+              req_headers_ptr: u32,
+              req_headers_len: u32,
+              req_body_ptr: u32,
               req_body_len: u32,
-              headers_ptr: u32,
-              headers_len: u32,
-              body_res_ptr: u32,
-              body_written_ptr: u32,
-              headers_res_ptr: u32,
-              headers_written_ptr: u32,
               status_code_ptr: u32,
-              err_ptr: u32,
-              err_written_ptr: u32|
+              res_handle_ptr: u32|
               -> u32 {
-            let span = tracing::trace_span!("req");
-            let _enter = span.enter();
-            // Get the module's memory and allocation function.
-            // If either is not found, the runtime cannot write any response
-            // data, so the execution cannot continue.
-            tracing::trace!(export = MEMORY, "getting export");
-            let memory = match caller.get_export(MEMORY) {
-                Some(Extern::Memory(mem)) => mem,
-                _ => {
-                    return err(
-                        "cannot find memory".to_string(),
-                        None,
-                        None,
-                        err_ptr,
-                        err_written_ptr,
-                        1,
-                    )
-                }
-            };
-            tracing::trace!(export = ALLOC_FN, "getting export");
-            let alloc = match caller.get_export(ALLOC_FN) {
-                Some(Extern::Func(func)) => func,
-                _ => {
-                    return err(
-                        "cannot find alloc function".to_string(),
-                        None,
-                        None,
-                        err_ptr,
-                        err_written_ptr,
-                        1,
-                    )
-                }
-            };
-
-            // Get the URL, headers, method, and request body from the module's memory.
-            let (url, headers, method, req_body) = match unsafe {
-                http_parts_from_memory(
-                    &memory,
-                    url_ptr,
-                    url_len,
-                    method_ptr,
-                    method_len,
-                    req_body,
-                    req_body_len,
-                    headers_ptr,
-                    headers_len,
-                )
-            } {
-                Ok(r) => (r.0, r.1, r.2, r.3),
-                Err(_) => {
-                    return err(
-                        "cannot get HTTP parts from memory".to_string(),
-                        Some(&memory),
-                        Some(&alloc),
-                        err_ptr,
-                        err_written_ptr,
-                        4,
-                    )
-                }
-            };
-
-            match is_allowed(&url, allowed_hosts.as_ref()) {
-                Ok(e) => match e {
-                    true => {}
-                    false => {
-                        return err(
-                            format!(
-                            "URL {} not allowed because domain or subdomain not in allowed list",
-                            url
-                        ),
-                            Some(&memory),
-                            Some(&alloc),
-                            err_ptr,
-                            err_written_ptr,
-                            4,
-                        )
-                    }
-                },
-                Err(e) => {
-                    return err(
-                        e.to_string(),
-                        Some(&memory),
-                        Some(&alloc),
-                        err_ptr,
-                        err_written_ptr,
-                        4,
-                    )
-                }
-            };
-
-            let (status, headers, body) = match request(url, headers, method, req_body) {
-                Ok(r) => (r.0, r.1, r.2),
-                Err(e) => {
-                    return err(
-                        e.to_string(),
-                        Some(&memory),
-                        Some(&alloc),
-                        err_ptr,
-                        err_written_ptr,
-                        3,
-                    )
-                }
-            };
-            tracing::debug!(
-                status,
-                ?headers,
-                body_len = body.as_ref().len(),
-                "got HTTP response, writing back to memory"
-            );
-
-            // Write the HTTP response back to the module's memory.
-            unsafe {
-                match write_http_response_to_memory(
-                    status,
-                    headers,
-                    body,
-                    memory.clone(),
-                    alloc.clone(),
-                    headers_written_ptr,
-                    headers_res_ptr,
-                    body_res_ptr,
-                    status_code_ptr,
-                    body_written_ptr,
-                ) {
-                    Ok(_) => 0,
-                    Err(e) => err(
-                        e.to_string(),
-                        Some(&memory),
-                        Some(&alloc),
-                        err_ptr,
-                        err_written_ptr,
-                        3,
-                    ),
-                }
+            match HostCalls::req(
+                st.clone(),
+                allowed_hosts.as_deref(),
+                caller,
+                url_ptr,
+                url_len,
+                method_ptr,
+                method_len,
+                req_headers_ptr,
+                req_headers_len,
+                req_body_ptr,
+                req_body_len,
+                status_code_ptr,
+                res_handle_ptr,
+            ) {
+                Ok(()) => 0,
+                Err(e) => e.into(),
             }
         },
     )?;
@@ -293,11 +342,11 @@ pub fn link_http(
 
 #[tracing::instrument]
 fn request(
-    url: String,
+    url: &str,
     headers: HeaderMap,
     method: Method,
-    body: Vec<u8>,
-) -> Result<(u16, HeaderMap<HeaderValue>, Bytes), Error> {
+    body: &[u8],
+) -> Result<(u16, HeaderMap<HeaderValue>, Bytes), HttpError> {
     tracing::debug!(
         %url,
         ?headers,
@@ -305,6 +354,8 @@ fn request(
         body_len = body.len(),
         "performing request"
     );
+    let url: Url = url.parse().map_err(|_| HttpError::InvalidUrl)?;
+    let body = body.to_vec();
     match Handle::try_current() {
         Ok(r) => {
             // If running in a Tokio runtime, spawn a new blocking executor
@@ -320,23 +371,23 @@ fn request(
                 let client = Client::builder().build().unwrap();
                 let res = block_on(
                     client
-                        .request(method, &url)
+                        .request(method, url)
                         .headers(headers)
                         .body(body)
                         .send(),
                 )?;
-
-                return Ok((
+                Ok((
                     res.status().as_u16(),
                     res.headers().clone(),
                     block_on(res.bytes())?,
-                ));
-            }))?
+                ))
+            }))
+            .map_err(|_| HttpError::RuntimeError)?
         }
         Err(_) => {
             tracing::trace!("no tokio runtime available, using blocking request");
             let res = reqwest::blocking::Client::new()
-                .request(method, &url)
+                .request(method, url)
                 .headers(headers)
                 .body(body)
                 .send()?;
@@ -345,168 +396,21 @@ fn request(
     }
 }
 
-/// Get the URL, method, request body, and headers from the
-/// module's memory.
-#[allow(clippy::too_many_arguments)]
-unsafe fn http_parts_from_memory(
-    memory: &Memory,
-    url_ptr: u32,
-    url_len: u32,
-    method_ptr: u32,
-    method_len: u32,
-    req_body_ptr: u32,
-    req_body_len: u32,
-    headers_ptr: u32,
-    headers_len: u32,
-) -> Result<(String, HeaderMap, Method, Vec<u8>), Error> {
-    let url = string_from_memory(&memory, url_ptr, url_len)?;
-    let headers = string_from_memory(&memory, headers_ptr, headers_len)?;
-    let headers = wasi_experimental_http::string_to_header_map(&headers)?;
-    let method = string_from_memory(&memory, method_ptr, method_len)?;
-    let method = Method::from_str(&method)?;
-    let req_body = vec_from_memory(&memory, req_body_ptr, req_body_len);
-
-    Ok((url, headers, method, req_body))
-}
-
-/// Write the response data to the module's memory.
-#[allow(clippy::too_many_arguments)]
-unsafe fn write_http_response_to_memory(
-    status: u16,
-    headers: HeaderMap,
-    res: Bytes,
-    memory: Memory,
-    alloc: Func,
-    headers_written_ptr: u32,
-    headers_res_ptr: u32,
-    body_res_ptr: u32,
-    status_code_ptr: u32,
-    body_written_ptr: u32,
-) -> Result<(), Error> {
-    let hs = wasi_experimental_http::header_map_to_string(&headers)?;
-    // Write the response headers.
-    write(&hs, headers_res_ptr, headers_written_ptr, &memory, &alloc)?;
-
-    // Write the status code pointer.
-    let status_tmp_ptr = memory.data_ptr().offset(status_code_ptr as isize) as *mut u16;
-    *status_tmp_ptr = status;
-
-    // Write the response body.
-    write(&res, body_res_ptr, body_written_ptr, &memory, &alloc)?;
-
-    Ok(())
-}
-
-fn is_allowed(url: &str, allowed_domains: Option<&Vec<String>>) -> Result<bool, Error> {
-    let url_host = Url::parse(url)?.host_str().unwrap().to_owned();
+fn is_allowed(url: &str, allowed_domains: Option<&[String]>) -> Result<bool, HttpError> {
+    let url_host = Url::parse(url)
+        .map_err(|_| HttpError::InvalidUrl)?
+        .host_str()
+        .ok_or(HttpError::InvalidUrl)?
+        .to_owned();
     match allowed_domains {
         Some(domains) => {
             let allowed: Result<Vec<_>, _> = domains.iter().map(|d| Url::parse(d)).collect();
-            let allowed = allowed?;
+            let allowed = allowed.map_err(|_| HttpError::InvalidUrl)?;
             let a: Vec<&str> = allowed.iter().map(|u| u.host_str().unwrap()).collect();
             Ok(a.contains(&url_host.as_str()))
         }
         None => Ok(false),
     }
-}
-
-/// Write error details into the module's memory and return.
-fn err(
-    msg: String,
-    memory: Option<&Memory>,
-    alloc: Option<&Func>,
-    err_ptr: u32,
-    err_len_ptr: u32,
-    err_code: u32,
-) -> u32 {
-    let memory = match memory {
-        Some(m) => m,
-        None => return err_code,
-    };
-    let alloc = match alloc {
-        Some(a) => a,
-        None => return err_code,
-    };
-    let _ = write(&msg, err_ptr, err_len_ptr, memory, alloc);
-    err_code
-}
-
-/// Read a byte array from the instance's `memory`  of length `len_ptr`
-/// starting at offset `data_ptr`
-unsafe fn data_from_memory(memory: &Memory, data_ptr: u32, len: u32) -> (Option<&[u8]>, u32) {
-    println!("wasi_experimental_http::data_from_memory:: length: {}", len);
-
-    let data = memory
-        .data_unchecked()
-        .get(data_ptr as u32 as usize..)
-        .and_then(|arr| arr.get(..len as u32 as usize));
-
-    (data, len)
-}
-
-/// Get a `Vec<u8>` from the module's memory.
-unsafe fn vec_from_memory(memory: &Memory, data_ptr: u32, len_ptr: u32) -> Vec<u8> {
-    let (data, _) = data_from_memory(&memory, data_ptr, len_ptr);
-    // Normally, this should never panic.
-    data.unwrap_or_default().to_vec()
-}
-
-/// Read a string from the instance's `memory`  of length `len`
-/// starting at offset `data_ptr`
-unsafe fn string_from_memory(
-    memory: &Memory,
-    data_ptr: u32,
-    len: u32,
-) -> Result<String, anyhow::Error> {
-    let (data, _) = data_from_memory(&memory, data_ptr, len);
-    let str = match data {
-        Some(data) => match std::str::from_utf8(data) {
-            Ok(s) => s,
-            Err(_) => return Err(anyhow::Error::msg("invalid utf-8")),
-        },
-        None => return Err(anyhow::Error::msg("pointer/length out of bounds")),
-    };
-
-    Ok(String::from(str))
-}
-
-/// Write a byte array into the instance's linear memory
-/// and return the offset relative to the module's memory.
-fn write(
-    data: impl AsRef<[u8]>,
-    ptr: u32,
-    bytes_written_ptr: u32,
-    memory: &Memory,
-    alloc: &Func,
-) -> Result<(), Error> {
-    let bytes = data.as_ref();
-    let alloc_result = alloc.call(&[Val::from(bytes.len() as i32)])?;
-    let guest_ptr_offset = match alloc_result
-        .get(0)
-        .expect("expected the result of the allocation to have one value")
-    {
-        Val::I32(val) => *val as isize,
-        _ => return Err(Error::msg("guest pointer must be Val::I32")),
-    };
-    unsafe {
-        let raw = memory.data_ptr().offset(guest_ptr_offset);
-        raw.copy_from(bytes.as_ptr(), bytes.len());
-
-        // Get the offsite to `written` in the module's memory and set its value
-        // to the number of body bytes written.
-        let written_ptr = memory.data_ptr().offset(bytes_written_ptr as isize) as *mut u32;
-        *written_ptr = bytes.len() as u32;
-        println!(
-            "wasi_experimental_http::write_guest_memory:: written {} bytes",
-            *written_ptr
-        );
-
-        // Write result pointer.
-        let res_ptr = memory.data_ptr().offset(ptr as isize) as *mut u32;
-        *res_ptr = guest_ptr_offset as u32;
-    }
-
-    Ok(())
 }
 
 #[test]
