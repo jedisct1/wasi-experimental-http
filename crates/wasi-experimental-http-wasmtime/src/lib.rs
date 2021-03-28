@@ -3,6 +3,9 @@ use bytes::Bytes;
 use futures::executor::block_on;
 use http::{HeaderMap, HeaderValue};
 use reqwest::{Client, Method};
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
 use std::str::FromStr;
 use tokio::runtime::Handle;
 use url::Url;
@@ -11,7 +14,122 @@ use wasmtime::*;
 const ALLOC_FN: &str = "alloc";
 const MEMORY: &str = "memory";
 
-pub fn link_http(linker: &mut Linker, allowed_hosts: Option<Vec<String>>) -> Result<(), Error> {
+pub type WasiHandle = u32;
+
+struct Body {
+    bytes: Vec<u8>,
+    pos: usize,
+}
+
+struct Response {
+    headers: HeaderMap,
+    body: Body,
+}
+
+#[derive(Default)]
+pub struct State {
+    responses: HashMap<WasiHandle, Response>,
+    current_response_id: WasiHandle,
+}
+
+pub fn link_http(
+    linker: &mut Linker,
+    allowed_hosts: Option<Vec<String>>,
+    state: Rc<RefCell<State>>,
+) -> Result<(), Error> {
+    let st = state.clone();
+    linker.func(
+        "wasi_experimental_http",
+        "close",
+        move |_caller: Caller<'_>, handle: WasiHandle| -> u32 {
+            st.borrow_mut().responses.remove(&handle);
+            0
+        },
+    )?;
+
+    let st = state.clone();
+    linker.func(
+        "wasi_experimental_http",
+        "body_read",
+        move |caller: Caller<'_>,
+              handle: WasiHandle,
+              buf_ptr: u32,
+              buf_len: u32,
+              buf_written_ptr: u32|
+              -> u32 {
+            let mut st = st.borrow_mut();
+            let body = match st.responses.get_mut(&handle) {
+                None => return 1,
+                Some(response) => &mut response.body,
+            };
+            let memory = match caller.get_export(MEMORY) {
+                Some(Extern::Memory(mem)) => mem,
+                _ => return 5,
+            };
+            let available = std::cmp::min(buf_len as _, body.bytes.len() - body.pos);
+            if memory
+                .write(buf_ptr as _, &body.bytes[body.pos..body.pos + available])
+                .is_err()
+            {
+                return 6;
+            };
+            body.pos += available;
+            if memory
+                .write(buf_written_ptr as _, &(available as u32).to_le_bytes())
+                .is_err()
+            {
+                return 6;
+            }
+            0
+        },
+    )?;
+
+    let st = state.clone();
+    linker.func(
+        "wasi_experimental_http",
+        "header_get",
+        move |caller: Caller<'_>,
+              handle: WasiHandle,
+              key_ptr: u32,
+              key_len: u32,
+              value_ptr: u32,
+              value_len: u32,
+              value_written_ptr: u32|
+              -> u32 {
+            let st = st.borrow();
+            let headers = match st.responses.get(&handle) {
+                None => return 1,
+                Some(response) => &response.headers,
+            };
+            let memory = match caller.get_export(MEMORY) {
+                Some(Extern::Memory(mem)) => mem,
+                _ => return 5,
+            };
+
+            let required_size = key_ptr.checked_add(key_len).unwrap() as _;
+            if memory.data_size() < required_size {
+                return 6;
+            }
+            let key = &unsafe { memory.data_unchecked() }
+                [key_ptr as usize..key_ptr as usize + key_len as usize];
+            let key = std::str::from_utf8(key).unwrap();
+            let value = match headers.get(key) {
+                None => return 7,
+                Some(value) => value,
+            };
+            if value.len() > value_len as _ {
+                return 9;
+            }
+            if memory.write(value_ptr as _, value.as_bytes()).is_err() {
+                return 8;
+            }
+            memory
+                .write(value_written_ptr as _, &(value.len() as u32).to_le_bytes())
+                .unwrap();
+            0
+        },
+    )?;
+
     linker.func(
         "wasi_experimental_http",
         "req",

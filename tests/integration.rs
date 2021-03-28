@@ -92,7 +92,7 @@ mod tests {
         let wasi = Wasi::new(&store, ctx);
         wasi.add_to_linker(&mut linker)?;
         // Link `wasi_experimental_http::req`.
-        link_http(&mut linker, allowed_domains)?;
+        link_http(&mut linker, allowed_domains, Default::default())?;
 
         let module = wasmtime::Module::from_file(store.engine(), filename)?;
 
