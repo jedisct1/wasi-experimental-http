@@ -122,7 +122,7 @@ impl HostCalls {
         handle: WasiHandle,
         buf_ptr: u32,
         buf_len: u32,
-        buf_written_ptr: u32,
+        buf_read_ptr: u32,
     ) -> Result<(), HttpError> {
         let mut st = st.borrow_mut();
         let mut body = &mut st
@@ -134,7 +134,7 @@ impl HostCalls {
         let available = std::cmp::min(buf_len as _, body.bytes.len() - body.pos);
         memory.write(buf_ptr as _, &body.bytes[body.pos..body.pos + available])?;
         body.pos += available;
-        memory.write(buf_written_ptr as _, &(available as u32).to_le_bytes())?;
+        memory.write(buf_read_ptr as _, &(available as u32).to_le_bytes())?;
         Ok(())
     }
 
@@ -142,8 +142,8 @@ impl HostCalls {
         st: Rc<RefCell<State>>,
         caller: Caller<'_>,
         handle: WasiHandle,
-        key_ptr: u32,
-        key_len: u32,
+        name_ptr: u32,
+        name_len: u32,
         value_ptr: u32,
         value_len: u32,
         value_written_ptr: u32,
@@ -155,7 +155,7 @@ impl HostCalls {
             .ok_or(HttpError::InvalidHandle(handle))?
             .headers;
         let memory = memory_get(caller)?;
-        let key = string_from_memory(&memory, key_ptr, key_len)?;
+        let key = string_from_memory(&memory, name_ptr, name_len)?.to_ascii_lowercase();
         let value = headers.get(key).ok_or(HttpError::HeaderNotFound)?;
         if value.len() > value_len as _ {
             return Err(HttpError::BufferTooSmall);
@@ -231,113 +231,128 @@ impl HostCalls {
     }
 }
 
-pub fn link_http(
-    linker: &mut Linker,
-    allowed_hosts: Option<Vec<String>>,
+pub struct Http {
     state: Rc<RefCell<State>>,
-) -> Result<(), Error> {
-    let st = state.clone();
-    linker.func(
-        "wasi_experimental_http",
-        "close",
-        move |caller: Caller<'_>, handle: WasiHandle| -> u32 {
-            match HostCalls::close(st.clone(), caller, handle) {
-                Ok(()) => 0,
-                Err(e) => e.into(),
-            }
-        },
-    )?;
+    allowed_hosts: Rc<Option<Vec<String>>>,
+}
 
-    let st = state.clone();
-    linker.func(
-        "wasi_experimental_http",
-        "body_read",
-        move |caller: Caller<'_>,
-              handle: WasiHandle,
-              buf_ptr: u32,
-              buf_len: u32,
-              buf_written_ptr: u32|
-              -> u32 {
-            match HostCalls::body_read(
-                st.clone(),
-                caller,
-                handle,
-                buf_ptr,
-                buf_len,
-                buf_written_ptr,
-            ) {
-                Ok(()) => 0,
-                Err(e) => e.into(),
-            }
-        },
-    )?;
+impl Http {
+    pub const MODULE: &'static str = "wasi_experimental_http";
 
-    let st = state.clone();
-    linker.func(
-        "wasi_experimental_http",
-        "header_get",
-        move |caller: Caller<'_>,
-              handle: WasiHandle,
-              key_ptr: u32,
-              key_len: u32,
-              value_ptr: u32,
-              value_len: u32,
-              value_written_ptr: u32|
-              -> u32 {
-            match HostCalls::header_get(
-                st.clone(),
-                caller,
-                handle,
-                key_ptr,
-                key_len,
-                value_ptr,
-                value_len,
-                value_written_ptr,
-            ) {
-                Ok(()) => 0,
-                Err(e) => e.into(),
-            }
-        },
-    )?;
+    pub fn new(allowed_hosts: Option<Vec<String>>) -> Result<Self, Error> {
+        let state = Rc::new(RefCell::new(State::default()));
+        let allowed_hosts = Rc::new(allowed_hosts);
+        Ok(Http {
+            state,
+            allowed_hosts,
+        })
+    }
 
-    let st = state.clone();
-    linker.func(
-        "wasi_experimental_http",
-        "req",
-        move |caller: Caller<'_>,
-              url_ptr: u32,
-              url_len: u32,
-              method_ptr: u32,
-              method_len: u32,
-              req_headers_ptr: u32,
-              req_headers_len: u32,
-              req_body_ptr: u32,
-              req_body_len: u32,
-              status_code_ptr: u32,
-              res_handle_ptr: u32|
-              -> u32 {
-            match HostCalls::req(
-                st.clone(),
-                allowed_hosts.as_deref(),
-                caller,
-                url_ptr,
-                url_len,
-                method_ptr,
-                method_len,
-                req_headers_ptr,
-                req_headers_len,
-                req_body_ptr,
-                req_body_len,
-                status_code_ptr,
-                res_handle_ptr,
-            ) {
-                Ok(()) => 0,
-                Err(e) => e.into(),
-            }
-        },
-    )?;
+    pub fn add_to_linker(&self, linker: &mut Linker) -> Result<(), Error> {
+        let st = self.state.clone();
+        linker.func(
+            Self::MODULE,
+            "close",
+            move |caller: Caller<'_>, handle: WasiHandle| -> u32 {
+                match HostCalls::close(st.clone(), caller, handle) {
+                    Ok(()) => 0,
+                    Err(e) => e.into(),
+                }
+            },
+        )?;
 
-    Ok(())
+        let st = self.state.clone();
+        linker.func(
+            Self::MODULE,
+            "body_read",
+            move |caller: Caller<'_>,
+                  handle: WasiHandle,
+                  buf_ptr: u32,
+                  buf_len: u32,
+                  buf_read_ptr: u32|
+                  -> u32 {
+                match HostCalls::body_read(
+                    st.clone(),
+                    caller,
+                    handle,
+                    buf_ptr,
+                    buf_len,
+                    buf_read_ptr,
+                ) {
+                    Ok(()) => 0,
+                    Err(e) => e.into(),
+                }
+            },
+        )?;
+
+        let st = self.state.clone();
+        linker.func(
+            Self::MODULE,
+            "header_get",
+            move |caller: Caller<'_>,
+                  handle: WasiHandle,
+                  name_ptr: u32,
+                  name_len: u32,
+                  value_ptr: u32,
+                  value_len: u32,
+                  value_written_ptr: u32|
+                  -> u32 {
+                match HostCalls::header_get(
+                    st.clone(),
+                    caller,
+                    handle,
+                    name_ptr,
+                    name_len,
+                    value_ptr,
+                    value_len,
+                    value_written_ptr,
+                ) {
+                    Ok(()) => 0,
+                    Err(e) => e.into(),
+                }
+            },
+        )?;
+
+        let st = self.state.clone();
+        let allowed_hosts = self.allowed_hosts.clone();
+        linker.func(
+            Self::MODULE,
+            "req",
+            move |caller: Caller<'_>,
+                  url_ptr: u32,
+                  url_len: u32,
+                  method_ptr: u32,
+                  method_len: u32,
+                  req_headers_ptr: u32,
+                  req_headers_len: u32,
+                  req_body_ptr: u32,
+                  req_body_len: u32,
+                  status_code_ptr: u32,
+                  res_handle_ptr: u32|
+                  -> u32 {
+                match HostCalls::req(
+                    st.clone(),
+                    allowed_hosts.as_deref(),
+                    caller,
+                    url_ptr,
+                    url_len,
+                    method_ptr,
+                    method_len,
+                    req_headers_ptr,
+                    req_headers_len,
+                    req_body_ptr,
+                    req_body_len,
+                    status_code_ptr,
+                    res_handle_ptr,
+                ) {
+                    Ok(()) => 0,
+                    Err(e) => e.into(),
+                }
+            },
+        )?;
+
+        Ok(())
+    }
 }
 
 #[tracing::instrument]

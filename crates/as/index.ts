@@ -111,17 +111,12 @@ export class RequestBuilder {
     url_len_ptr: usize,
     method_ptr: usize,
     method_len_ptr: usize,
+    req_headers_ptr: usize,
+    req_headers_len_ptr: usize,
     req_body_ptr: usize,
     req_body_len_ptr: usize,
-    heders_ptr: usize,
-    headers_len_ptr: usize,
-    body_res_ptr: usize,
-    body_written_ptr: usize,
-    headers_written_ptr: usize,
-    headers_res_ptr: usize,
     status_code_ptr: usize,
-    err_ptr: usize,
-    err_written_ptr: usize
+    res_handle_ptr: usize,
 ): u32;
 
 function raw_request(
