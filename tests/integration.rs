@@ -68,7 +68,7 @@ mod tests {
         for func_name in test_funcs.iter() {
             let func = instance
                 .get_func(func_name)
-                .expect(&format!("cannot find function {}", func_name));
+                .unwrap_or_else(|| panic!("cannot find function {}", func_name));
             func.call(&[])?;
         }
 

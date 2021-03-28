@@ -1,7 +1,6 @@
 // @ts-ignore
 import { Console } from "as-wasi";
 import { Method, RequestBuilder, Response } from "../../crates/as";
-export { alloc } from "../../crates/as";
 
 export function post(): void {
   let body = String.UTF8.encode("testing the body");
@@ -13,6 +12,7 @@ export function post(): void {
     .send();
 
   check(res, 200, "Content-Type");
+  res.close();
 }
 
 export function get(): void {
@@ -25,6 +25,7 @@ export function get(): void {
   if (String.UTF8.decode(body.buffer) != '"OK"') {
     abort();
   }
+  res.close();
 }
 
 function check(

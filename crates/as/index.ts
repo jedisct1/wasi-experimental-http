@@ -61,6 +61,11 @@ export class Response {
         let value = value_buf.subarray(0, load<u32>(value_len_ptr));
         return String.UTF8.decode(value.buffer);
     }
+
+    public close(): void {
+        close(this.handle);
+
+    }
 }
 
 /** An HTTP request.
@@ -218,12 +223,6 @@ function raw_request(
         // Based on the error code, read and log the error.
         Console.log("ERROR CODE: " + err.toString());
 
-        // Error code 1 means no error message was written.
-        if (err == 1) {
-            Console.log("Runtime error: cannot find exported alloc function or memory");
-            abort();
-        }
-
         // An error code was written. Read it, then abort.       
         Console.log("Runtime error: " + err.toString());
         abort();
@@ -231,17 +230,6 @@ function raw_request(
 
     let status = load<usize>(status_code_ptr) as u16;
     let handle = load<usize>(res_handle_ptr) as u32;
-
-    /*
-    let body_size = load<usize>(body_written_ptr) as u32;
-    let body_res = new ArrayBuffer(body_size);
-    memory.copy(changetype<usize>(body_res), load<usize>(body_res_ptr), body_size);
-
-    let headers_length = load<usize>(headers_written_ptr) as u32;
-    let headers_res_buf = new ArrayBuffer(headers_length);
-    memory.copy(changetype<usize>(headers_res_buf), load<usize>(headers_res_ptr), headers_length);
-    let headers_res = String.UTF8.decode(headers_res_buf);
-    */
 
     return new Response(status, handle);
 }
@@ -295,14 +283,6 @@ function methodEnumToString(m: Method): string {
         default:
             return "";
     }
-}
-
-/** Allocate memory for a new byte array of size `len`
- * and return the offset into the module's linear memory
- * to the start of the block. */
-export function alloc(len: i32): usize {
-    let buf = new ArrayBuffer(len);
-    return changetype<usize>(buf);
 }
 
 /** The standard HTTP status codes. */
